@@ -28,3 +28,4 @@ EXPOSE 3000
 # Start Next in production
 ENV PORT=3000
 CMD ["npm", "start"]
+CMD ["sh", "-c", "npm run start"]

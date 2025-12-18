@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: cookclip
+    env: docker
+    plan: free
+
+    # Where your Dockerfile lives
+    dockerfilePath: ./Dockerfile
+
+    # Region (pick any Render region you like)
+    region: oregon
+
+    # Health check (Next.js serves "/" so this is fine)
+    healthCheckPath: /
+
+    # Automatically redeploy on git push
+    autoDeploy: true
+
+    # Optional, but nice to be explicit
+    numInstances: 1
