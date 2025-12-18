@@ -64,8 +64,8 @@ export async function POST(req: Request) {
 
     // 2) Whisper fallback
     let usedWhisper = false;
-    let whisperError: string | null = null;
 
+    let whisperError: string | undefined;
     const minChars = 40;
     const sourceTextLen = (source?.text ?? "").trim().length;
 
