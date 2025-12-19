@@ -2,8 +2,11 @@
 import { z } from "zod";
 import { fetchSourceText } from "@/lib/platform";
 import { extractRecipe } from "@/lib/recipe";
+import { transcribeUrl } from "@/lib/server/transcribe";
 
 export const runtime = "nodejs";
+
+type StepEvent = { t: number; step: string; msg?: string; data?: any };
 
 const BodySchema = z.object({
   url: z.string().url(),
@@ -12,113 +15,50 @@ const BodySchema = z.object({
   debug: z.boolean().optional().default(false),
 });
 
-type StepEvent = {
-  t: number; // ms timestamp
-  step: string;
-  msg?: string;
-  data?: any;
-};
-
-function now() {
-  return Date.now();
-}
-
-function shortErr(e: any) {
-  return e?.message ?? String(e);
-}
-
 export async function POST(req: Request) {
   const steps: StepEvent[] = [];
-  const push = (step: string, msg?: string, data?: any) => {
-    const ev: StepEvent = { t: now(), step };
-    if (msg) ev.msg = msg;
-    if (data !== undefined) ev.data = data;
-    steps.push(ev);
-  };
-
-  let currentStep = "start";
+  const push = (step: string, msg?: string, data?: any) =>
+    steps.push({ t: Date.now(), step, msg, data });
 
   try {
-    currentStep = "parse.body";
-    push(currentStep, "Reading request JSON");
-    const json = await req.json();
+    push("extract.start", "Parsing request body");
+    const { url, pastedText, whisperModel, debug } = BodySchema.parse(await req.json());
 
-    currentStep = "validate.body";
-    push(currentStep, "Validating input schema");
-    const { url, pastedText, whisperModel, debug } = BodySchema.parse(json);
-
-    const origin = new URL(req.url).origin;
-    push("env", `origin=${origin}`, { runtime: "nodejs" });
-
-    // 1) Platform-native text
-    currentStep = "fetchSourceText";
-    push(currentStep, "Fetching platform text (transcript/oEmbed/etc)", { url });
-
+    push("source.fetch.start", "Fetching platform-native text");
     const source = await fetchSourceText(url);
-    push("fetchSourceText.done", "Fetched platform result", {
-      platform: source?.platform,
-      title: source?.title,
-      author: source?.author,
-      textLen: source?.text?.length ?? 0,
+    push("source.fetch.done", "Fetched platform-native text", {
+      platform: source.platform,
+      textLen: source.text?.length ?? 0,
+      title: source.title,
     });
 
-    // 2) Whisper fallback
     let usedWhisper = false;
+    let whisperError: string | null = null;
 
-    let whisperError: string | undefined;
-    const minChars = 40;
-    const sourceTextLen = (source?.text ?? "").trim().length;
-
-    if (sourceTextLen < minChars) {
-      currentStep = "transcribe.fallback";
-      push(currentStep, "Platform text insufficient; calling /api/transcribe", {
-        sourceTextLen,
-        minChars,
-        whisperModel,
-      });
-
+    // Fallback to local whisper if we didn't get enough
+    if (!source.text || source.text.trim().length < 40) {
+      push("transcribe.start", `Running whisper (${whisperModel})`);
       try {
-        currentStep = "transcribe.fetch";
-        const resp = await fetch(`${origin}/api/transcribe`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url, model: whisperModel }),
-        });
+        const tr = await transcribeUrl(url, whisperModel);
 
-        push("transcribe.fetch.done", `HTTP ${resp.status}`, { ok: resp.ok });
-
-        currentStep = "transcribe.parse";
-        const raw = await resp.text();
-        let tr: any = null;
-        try {
-          tr = raw ? JSON.parse(raw) : null;
-        } catch {
-          throw new Error(`Transcribe returned invalid JSON: ${raw.slice(0, 200)}`);
-        }
-
-        if (!resp.ok) {
-          whisperError = tr?.error || `Transcribe failed with HTTP ${resp.status}`;
-          push("transcribe.error", whisperError, tr);
-        } else if (tr?.ok && typeof tr.text === "string" && tr.text.trim()) {
+        if (tr.text && tr.text.trim()) {
           source.text = tr.text;
           usedWhisper = true;
-          push("transcribe.success", "Whisper text applied", { textLen: tr.text.length });
+          push("transcribe.done", "Whisper transcription ok", { textLen: tr.text.length });
         } else {
           whisperError = "Transcribe returned no text.";
-          push("transcribe.empty", whisperError, tr);
+          push("transcribe.error", whisperError);
         }
       } catch (e: any) {
-        whisperError = shortErr(e);
+        whisperError = e?.message ?? "Transcribe failed.";
         push("transcribe.exception", whisperError);
       }
     } else {
-      push("transcribe.skip", "Platform text sufficient; skipping Whisper", { sourceTextLen });
+      push("transcribe.skip", "Platform text was sufficient");
     }
 
-    // 3) Combine text
-    currentStep = "combine.text";
-    push(currentStep, "Combining source + pasted text");
-
+    // Combine text
+    push("combine.start", "Combining text sources");
     const combinedText = [
       source.title ? `TITLE: ${source.title}` : "",
       source.author ? `AUTHOR: ${source.author}` : "",
@@ -128,68 +68,57 @@ export async function POST(req: Request) {
       .filter(Boolean)
       .join("\n\n");
 
-    push("combine.text.done", "Combined text built", { combinedLen: combinedText.length });
+    push("combine.done", "Combined text ready", { combinedLen: combinedText.length });
 
-    if (combinedText.trim().length < minChars) {
-      currentStep = "reject.notEnoughText";
-      push(currentStep, "Not enough text to extract recipe", {
-        minChars,
-        combinedLen: combinedText.trim().length,
-      });
-
+    if (combinedText.trim().length < 40) {
+      push("extract.fail", "Not enough text to extract a recipe");
       return Response.json(
         {
-          ok: false,
-          step: currentStep,
           error:
             "Not enough text to extract a recipe. Try pasting captions/transcript into the textbox.",
-          sourceUsed: source,
+          step: "extract.fail",
+          steps,
+          sourceUsed: debug ? source : { platform: source.platform, title: source.title, author: source.author },
           usedWhisper,
           ...(debug ? { whisperError } : {}),
-          steps,
         },
         { status: 400 }
       );
     }
 
-    // 4) Extract recipe
-    currentStep = "extractRecipe";
-    push(currentStep, "Running recipe extraction");
-
+    // Extract recipe
+    push("recipe.extract.start", "Extracting recipe");
     const recipe = await extractRecipe(combinedText, {
       sourceUrl: url,
       sourceTitle: source.title,
     });
+    push("recipe.extract.done", "Recipe extracted");
 
-    push("extractRecipe.done", "Recipe extracted", {
-      title: recipe?.title,
-      ingredients: recipe?.ingredients?.length ?? 0,
-      stepsCount: recipe?.steps?.length ?? 0,
-    });
-
-    currentStep = "done";
-    push(currentStep, "Success");
+    // Avoid sending huge transcripts unless debug
+    const sourceUsed = debug
+      ? {
+          ...source,
+          text: (source.text || "").slice(0, 8000), // keep UI responsive
+        }
+      : { platform: source.platform, title: source.title, author: source.author };
 
     return Response.json({
-      ok: true,
       recipe,
-      sourceUsed: source,
+      steps,
+      sourceUsed,
       usedWhisper,
       ...(debug ? { whisperError } : {}),
-      steps,
     });
   } catch (err: any) {
-    const msg = shortErr(err);
-    steps.push({ t: now(), step: "exception", msg, data: { at: currentStep } });
-
+    push("extract.exception", err?.message ?? "Unknown error");
     return Response.json(
       {
-        ok: false,
-        step: currentStep,
-        error: msg,
+        error: err?.message ?? "Unknown error",
+        step: "extract.exception",
         steps,
       },
       { status: 400 }
     );
   }
 }
+
