@@ -50,8 +50,8 @@ export async function POST(req: Request) {
           push("transcribe.error", whisperError);
         }
       } catch (e: any) {
+        push("transcribe.exception", whisperError ?? "Transcribe failed.");
         whisperError = e?.message ?? "Transcribe failed.";
-        push("transcribe.exception", whisperError);
       }
     } else {
       push("transcribe.skip", "Platform text was sufficient");
